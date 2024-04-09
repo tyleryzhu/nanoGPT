@@ -19,6 +19,7 @@ $ torchrun --nproc_per_node=8 --nnodes=2 --node_rank=1 --master_addr=123.456.123
 import os
 import time
 import math
+import json
 import pickle
 from contextlib import nullcontext
 
@@ -41,6 +42,7 @@ eval_only = False # if True, script exits right after the first eval
 always_save_checkpoint = True # if True, always save a checkpoint after each eval
 init_from = 'scratch' # 'scratch' or 'resume' or 'gpt2*'
 # wandb logging
+json_log = True # disabled by default
 wandb_log = False # disabled by default
 wandb_project = 'owt'
 wandb_run_name = 'gpt2' # 'run' + str(time.time())
@@ -256,6 +258,10 @@ if wandb_log and master_process:
     import wandb
     wandb.init(project=wandb_project, name=wandb_run_name, config=config)
 
+if json_log:
+    with open(os.path.join(out_dir, "log.txt"), "w") as f:
+        pass
+
 # training loop
 X, Y = get_batch('train') # fetch the very first batch
 t0 = time.time()
@@ -281,6 +287,15 @@ while True:
                 "lr": lr,
                 "mfu": running_mfu*100, # convert to percentage
             })
+        if json_log:
+            with open(os.path.join(out_dir, "log.txt"), "a+") as f:
+                json.dump({
+                    "iter": iter_num, 
+                    "train_loss": losses['train'].item(),
+                    "val_loss": losses['val'].item(), 
+                    "lr": lr 
+                }, f)
+                f.write("\n")
         if losses['val'] < best_val_loss or always_save_checkpoint:
             best_val_loss = losses['val']
             if iter_num > 0:

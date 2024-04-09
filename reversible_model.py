@@ -169,7 +169,7 @@ class ReversibleBlock(nn.Module):
 
 
 class RevBackProp(Function):
-    debug: bool = True
+    debug: bool = False
 
     @staticmethod
     def forward(ctx, x, layers):
@@ -480,7 +480,7 @@ class ReversibleGPT(nn.Module):
 if __name__ == "__main__":
     # TODO: set the rng state for dropouts. 
     torch.random.manual_seed(0)
-    RevBackProp.debug = True
+    RevBackProp.debug = False
     gptconf = GPTConfig(block_size=256, vocab_size=1024, n_layer=12, n_head=4, n_embd=256, dropout=0.0, bias=True)
     revGPT = ReversibleGPT(gptconf)
     # revGPT.use_vanilla_backward = True
