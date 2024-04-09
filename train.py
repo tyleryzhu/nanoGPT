@@ -44,7 +44,7 @@ init_from = 'scratch' # 'scratch' or 'resume' or 'gpt2*'
 # wandb logging
 json_log = True # disabled by default
 wandb_log = False # disabled by default
-wandb_project = 'owt'
+wandb_project = 'nanoGPT'
 wandb_run_name = 'gpt2' # 'run' + str(time.time())
 # data
 dataset = 'openwebtext'
