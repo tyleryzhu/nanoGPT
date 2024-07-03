@@ -53,6 +53,7 @@ batch_size = 12 # if gradient_accumulation_steps > 1, this is the micro-batch si
 block_size = 1024
 # model
 reversible = False
+vanilla_backward = False # if True, use vanilla autograd for backward pass
 n_layer = 12
 n_head = 12
 n_embd = 768
@@ -160,6 +161,8 @@ if init_from == 'scratch':
     gptconf = GPTConfig(**model_args)
     if reversible:
         model = ReversibleGPT(gptconf)
+        model.use_vanilla_backward = vanilla_backward
+        print("Using Reversible vanilla backward:", model.use_vanilla_backward)
     else:
         model = GPT(gptconf)
 elif init_from == 'resume':
@@ -286,6 +289,7 @@ while True:
                 "val/loss": losses['val'],
                 "lr": lr,
                 "mfu": running_mfu*100, # convert to percentage
+                "mem": torch.cuda.max_memory_reserved() / 1e9 if device_type == 'cuda' else 0,
             })
         if json_log:
             with open(os.path.join(out_dir, "log.txt"), "a+") as f:
@@ -293,6 +297,7 @@ while True:
                     "iter": iter_num, 
                     "train_loss": losses['train'].item(),
                     "val_loss": losses['val'].item(), 
+                    "mem": torch.cuda.max_memory_reserved() / 1e9 if device_type == 'cuda' else 0,
                     "lr": lr 
                 }, f)
                 f.write("\n")
@@ -346,10 +351,11 @@ while True:
         # get loss as float. note: this is a CPU-GPU sync point
         # scale up to undo the division above, approximating the true total loss (exact would have been a sum)
         lossf = loss.item() * gradient_accumulation_steps
+        mem = torch.cuda.max_memory_reserved() / 1e9 if device_type == 'cuda' else 0
         if local_iter_num >= 5: # let the training loop settle a bit
             mfu = raw_model.estimate_mfu(batch_size * gradient_accumulation_steps, dt)
             running_mfu = mfu if running_mfu == -1.0 else 0.9*running_mfu + 0.1*mfu
-        print(f"iter {iter_num}: loss {lossf:.4f}, time {dt*1000:.2f}ms, mfu {running_mfu*100:.2f}%")
+        print(f"iter {iter_num}: loss {lossf:.4f}, time {dt*1000:.2f}ms, mem {mem:.2f}GB, mfu {running_mfu*100:.2f}%")
     iter_num += 1
     local_iter_num += 1
 

@@ -24,11 +24,25 @@ class LayerNorm(nn.Module):
 
     def __init__(self, ndim, bias):
         super().__init__()
-        self.weight = nn.Parameter(torch.ones(ndim))
+        self.weight = nn.Parameter(torch.ones(ndim, dtype=torch.float64))
         self.bias = nn.Parameter(torch.zeros(ndim)) if bias else None
 
-    def forward(self, input):
-        return F.layer_norm(input, self.weight.shape, self.weight, self.bias, 1e-5)
+    def forward(self, input: torch.Tensor):
+        orig_type = input.dtype
+        ret = F.layer_norm(input.type(torch.float64), self.weight.shape, self.weight, self.bias, 1e-6)
+        # print("ret type 1", ret.type())
+        ret = ret.type(orig_type)
+        # print("ret type 2", ret.type())
+        return ret 
+
+# class LayerNorm(nn.LayerNorm):
+#     """Subclass torch's LayerNorm to handle fp16."""
+
+#     def forward(self, x: torch.Tensor):
+#         orig_type = x.dtype
+#         ret = super().forward(x.type(torch.float32))
+#         return ret.type(orig_type)
+
 
 class CausalSelfAttention(nn.Module):
 
@@ -101,13 +115,16 @@ class ReversibleBlock(nn.Module):
     def __init__(self, config):
         super().__init__()
         self.ln_1 = LayerNorm(config.n_embd, bias=config.bias)
+        # self.ln_1 = RMSNorm(config.n_embd, bias=config.bias)
         # self.ln_1 = nn.Identity()
         self.attn = CausalSelfAttention(config)
         # self.ln_2 = nn.Identity()
         self.ln_2 = LayerNorm(config.n_embd, bias=config.bias)
+        # self.ln_2 = RMSNorm(config.n_embd, bias=config.bias)
         self.mlp = MLP(config)
 
         # Each block includes the layernorm
+        # self.F = nn.Sequential(self.ln_1, self.attn)
         self.F = nn.Sequential(self.ln_1, self.attn)
         self.G = nn.Sequential(self.ln_2, self.mlp)
 
@@ -240,7 +257,7 @@ class ReversibleGPT(nn.Module):
         assert config.vocab_size is not None
         assert config.block_size is not None
         self.config = config
-        self.use_vanilla_backward = False
+        self.use_vanilla_backward = True
 
         self.transformer = nn.ModuleDict(dict(
             wte = nn.Embedding(config.vocab_size, config.n_embd),
@@ -479,22 +496,35 @@ class ReversibleGPT(nn.Module):
 
 if __name__ == "__main__":
     # TODO: set the rng state for dropouts. 
+    import os
     torch.random.manual_seed(0)
-    RevBackProp.debug = False
-    gptconf = GPTConfig(block_size=256, vocab_size=1024, n_layer=12, n_head=4, n_embd=256, dropout=0.0, bias=True)
-    revGPT = ReversibleGPT(gptconf)
-    # revGPT.use_vanilla_backward = True
+    device = torch.device("cuda")
+    try:
+        os.remove("fwd_activations.pkl")
+    except:
+        pass
+    try:
+        os.remove("bwd_activations.pkl")
+    except:
+        pass
+
+    RevBackProp.debug = True
+    gptconf = GPTConfig(block_size=256, vocab_size=1024, n_layer=4, n_head=4, n_embd=256, dropout=0.0, bias=False)
+    revGPT = ReversibleGPT(gptconf).to(device, dtype=torch.float64)
+    revGPT.use_vanilla_backward = False
+    print("vanilla bwd", revGPT.use_vanilla_backward)
     # lr = 1e-2
     lr = 6e-4
-    optimizer = revGPT.configure_optimizers(0.1, lr, (0.9, 0.95), "cpu")
+    optimizer = revGPT.configure_optimizers(0.1, lr, (0.9, 0.95), device_type=device)
     optimizer.zero_grad()
 
     # First, the loss outputs need to be the same obviously... 
     batch_size = 8
     seq_len = 128
-    dummy_in = torch.randint(0, 256, (batch_size, seq_len))
-    labels = torch.randint(0, 256, (batch_size, seq_len))
-    dummy_out, loss = revGPT(dummy_in, targets=labels)
+    dummy_in = torch.randint(0, 256, (batch_size, seq_len)).to(device)
+    labels = torch.randint(0, 256, (batch_size, seq_len)).to(device)
+    with torch.amp.autocast(device_type="cuda", dtype=torch.float64):
+        dummy_out, loss = revGPT(dummy_in, targets=labels)
     print("loss:", loss.item())
     loss.backward()
     optimizer.step()
@@ -502,7 +532,6 @@ if __name__ == "__main__":
 
     # Then make sure the activations between the forward of a dummy reversible and 
     # real reversible are equal. 
-    import os
     if RevBackProp.debug and os.path.exists("fwd_activations.pkl") and \
         os.path.exists("bwd_activations.pkl"):
         with open("fwd_activations.pkl", "rb") as f:
