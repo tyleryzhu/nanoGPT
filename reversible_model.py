@@ -19,6 +19,15 @@ from torch.nn import functional as F
 # Needed to implement custom backward pass
 from torch.autograd import Function as Function
 
+
+def two_sum(a: torch.Tensor, b: torch.Tensor):
+    """Knuth's TwoSum: returns (s, err) where s + err = a + b exactly in real arithmetic.
+    Works regardless of the relative magnitudes of a and b."""
+    s = a + b
+    v = s - a
+    err = (a - (s - v)) + (b - v)
+    return s, err
+
 class LayerNorm(nn.Module):
     """ LayerNorm but with an optional bias. PyTorch doesn't support simply bias=False """
 
@@ -133,26 +142,29 @@ class ReversibleBlock(nn.Module):
         forward pass equations:
         Y_1 = X_1 + Attention(X_2), F = Attention
         Y_2 = X_2 + MLP(Y_1), G = MLP
+
+        Uses Knuth's TwoSum to track the exact rounding error of each
+        residual addition, enabling exact reconstruction in the backward pass.
         """
 
         f_x2 = self.F(x2)
-        y1 = x1 + f_x2 
-        del x1 
+        y1, y1_err = two_sum(x1, f_x2)
+        del x1
 
         g_y1 = self.G(y1)
-        y2 = x2 + g_y1
+        y2, y2_err = two_sum(x2, g_y1)
         del x2
 
-        return y1, y2
+        return y1, y2, y1_err, y2_err
 
-    def backward_pass(self, y1, y2, dy1, dy2):
+    def backward_pass(self, y1, y2, dy1, dy2, y1_err, y2_err):
         """
         equation for activation recomputation:
-        X_2 = Y_2 - G(Y_1), G = MLP
+        X_2 = Y_2 - G(Y_1), G = MLP   (exact via TwoSum error correction)
         X_1 = Y_1 - F(X_2), F = Attention
 
-        And we use pytorch native logic carefully to
-        calculate gradients on F and G.
+        Uses TwoSum on the subtraction as well, then combines the forward
+        error (y2_err) with the subtraction error to achieve eps^2 precision.
         """
 
         with torch.enable_grad():
@@ -161,27 +173,29 @@ class ReversibleBlock(nn.Module):
             g_y1 = self.G(y1)
 
             g_y1.backward(dy2, retain_graph=True)
-        
+
         with torch.no_grad():
-            x2 = y2 - g_y1 
-            del g_y1 
+            x2_approx, sub_err = two_sum(y2, -g_y1)
+            x2 = x2_approx + (sub_err + y2_err)
+            del g_y1
 
-            dy1 = dy1 + y1.grad 
+            dy1 = dy1 + y1.grad
 
-            y1.grad = None 
-        
+            y1.grad = None
+
         with torch.enable_grad():
-            x2.requires_grad = True 
-            f_x2 = self.F(x2) 
+            x2.requires_grad = True
+            f_x2 = self.F(x2)
             f_x2.backward(dy1, retain_graph=True)
-        
+
         with torch.no_grad():
-            x1 = y1 - f_x2 
-            del f_x2, y1 
-            dy2 = dy2 + x2.grad 
-            x2.grad = None 
-            x2 = x2.detach() 
-        
+            x1_approx, sub_err = two_sum(y1, -f_x2)
+            x1 = x1_approx + (sub_err + y1_err)
+            del f_x2, y1
+            dy2 = dy2 + x2.grad
+            x2.grad = None
+            x2 = x2.detach()
+
         return x1, x2, dy1, dy2
 
 
@@ -193,15 +207,18 @@ class RevBackProp(Function):
         x1, x2 = torch.chunk(x, 2, dim=-1)
 
         all_tensors = []
+        err_tensors = []
         if RevBackProp.debug:
             all_tensors.append([x1.detach(), x2.detach()])
-    
+
         for layer in layers:
-            x1, x2 = layer(x1, x2)
+            x1, x2, y1_err, y2_err = layer(x1, x2)
             if RevBackProp.debug:
                 all_tensors.append([x1.detach(), x2.detach()])
+                err_tensors.append([y1_err.detach(), y2_err.detach()])
             else:
                 all_tensors = [x1.detach(), x2.detach()]
+                err_tensors.append([y1_err.detach(), y2_err.detach()])
 
         if RevBackProp.debug:
             with open("fwd_activations.pkl", "bw+") as f:
@@ -209,7 +226,8 @@ class RevBackProp(Function):
             all_tensors = all_tensors[-1]
 
         ctx.save_for_backward(*all_tensors)
-        ctx.layers = layers 
+        ctx.layers = layers
+        ctx.err_tensors = err_tensors
 
         return torch.cat([x1, x2], dim=-1)
 
@@ -217,15 +235,19 @@ class RevBackProp(Function):
     def backward(ctx, dx):
         dx1, dx2 = torch.chunk(dx, 2, dim=-1)
 
-        x1, x2 = ctx.saved_tensors 
-        layers = ctx.layers 
+        x1, x2 = ctx.saved_tensors
+        layers = ctx.layers
+        err_tensors = ctx.err_tensors
 
         if RevBackProp.debug:
             all_tensors = [[x1.detach(), x2.detach()]]
 
-        for _, layer in enumerate(layers[::-1]):
+        for i, layer in enumerate(layers[::-1]):
+            err_idx = len(layers) - 1 - i
+            y1_err, y2_err = err_tensors[err_idx]
             x1, x2, dx1, dx2 = layer.backward_pass(
-                y1=x1, y2=x2, dy1=dx1, dy2=dx2
+                y1=x1, y2=x2, dy1=dx1, dy2=dx2,
+                y1_err=y1_err, y2_err=y2_err,
             )
             if RevBackProp.debug:
                 all_tensors = [[x1.detach(), x2.detach()]] + all_tensors
@@ -234,9 +256,9 @@ class RevBackProp(Function):
             with open("bwd_activations.pkl", "bw+") as f:
                 pickle.dump(all_tensors, f)
             del all_tensors
-        
+
         dx = torch.cat([dx1, dx2], dim=-1)
-        del dx1, dx2, x1, x2 
+        del dx1, dx2, x1, x2
         return dx, None, None
 
 @dataclass
@@ -308,11 +330,10 @@ class ReversibleGPT(nn.Module):
         """
         Rev layers w/o rev backprop, for debugging.
         """
-        # Split into two streams 
         x1, x2 = torch.chunk(h, 2, dim=-1)
         for _, block in enumerate(blocks):
-            x1, x2 = block(x1, x2)
-        
+            x1, x2, _, _ = block(x1, x2)
+
         return torch.cat([x1, x2], dim=-1)
 
     def forward(self, idx, targets=None):
