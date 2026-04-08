@@ -20,13 +20,27 @@ from torch.nn import functional as F
 from torch.autograd import Function as Function
 
 
-def two_sum(a: torch.Tensor, b: torch.Tensor):
-    """Knuth's TwoSum: returns (s, err) where s + err = a + b exactly in real arithmetic.
-    Works regardless of the relative magnitudes of a and b."""
-    s = a + b
-    v = s - a
-    err = (a - (s - v)) + (b - v)
-    return s, err
+RESIDUAL_DTYPE = torch.float64
+
+def _to_residual_dtype(x: torch.Tensor) -> torch.Tensor:
+    """Upcast tensors to RESIDUAL_DTYPE for high-precision residual add/sub.
+    Never downcasts (e.g. float64 stays float64 even if RESIDUAL_DTYPE=float32)."""
+    target = RESIDUAL_DTYPE
+    if x.dtype == torch.float64 and target != torch.float64:
+        return x
+    return x.to(target)
+
+
+def _fn_input(x: torch.Tensor) -> torch.Tensor:
+    """Cast residual tensor to a dtype compatible with autocast function calls.
+    Float64 inputs bypass CUDA autocast, causing dtype mismatches with
+    bfloat16/float16 weights. Cast to float32 so autocast can handle them."""
+    device_type = x.device.type if x.is_cuda else 'cpu'
+    if (x.dtype == torch.float64
+        and torch.is_autocast_enabled(device_type)
+        and torch.get_autocast_dtype(device_type) != torch.float64):
+        return x.float()
+    return x
 
 class LayerNorm(nn.Module):
     """ LayerNorm but with an optional bias. PyTorch doesn't support simply bias=False """
@@ -39,18 +53,8 @@ class LayerNorm(nn.Module):
     def forward(self, input: torch.Tensor):
         orig_type = input.dtype
         ret = F.layer_norm(input.type(torch.float64), self.weight.shape, self.weight, self.bias, 1e-6)
-        # print("ret type 1", ret.type())
         ret = ret.type(orig_type)
-        # print("ret type 2", ret.type())
-        return ret 
-
-# class LayerNorm(nn.LayerNorm):
-#     """Subclass torch's LayerNorm to handle fp16."""
-
-#     def forward(self, x: torch.Tensor):
-#         orig_type = x.dtype
-#         ret = super().forward(x.type(torch.float32))
-#         return ret.type(orig_type)
+        return ret
 
 
 class CausalSelfAttention(nn.Module):
@@ -124,16 +128,10 @@ class ReversibleBlock(nn.Module):
     def __init__(self, config):
         super().__init__()
         self.ln_1 = LayerNorm(config.n_embd, bias=config.bias)
-        # self.ln_1 = RMSNorm(config.n_embd, bias=config.bias)
-        # self.ln_1 = nn.Identity()
         self.attn = CausalSelfAttention(config)
-        # self.ln_2 = nn.Identity()
         self.ln_2 = LayerNorm(config.n_embd, bias=config.bias)
-        # self.ln_2 = RMSNorm(config.n_embd, bias=config.bias)
         self.mlp = MLP(config)
 
-        # Each block includes the layernorm
-        # self.F = nn.Sequential(self.ln_1, self.attn)
         self.F = nn.Sequential(self.ln_1, self.attn)
         self.G = nn.Sequential(self.ln_2, self.mlp)
 
@@ -143,57 +141,61 @@ class ReversibleBlock(nn.Module):
         Y_1 = X_1 + Attention(X_2), F = Attention
         Y_2 = X_2 + MLP(Y_1), G = MLP
 
-        Uses Knuth's TwoSum to track the exact rounding error of each
-        residual addition, enabling exact reconstruction in the backward pass.
+        Residual additions use RESIDUAL_DTYPE (default float64) to ensure
+        backward subtraction (y - f) recovers x exactly, even under bfloat16
+        autocast.  Function inputs are cast to float32 via _fn_input so
+        autocast can handle them.  No extra per-layer storage is needed.
         """
 
-        f_x2 = self.F(x2)
-        y1, y1_err = two_sum(x1, f_x2)
+        f_x2 = self.F(_fn_input(x2))
+        y1 = _to_residual_dtype(x1) + _to_residual_dtype(f_x2)
         del x1
 
-        g_y1 = self.G(y1)
-        y2, y2_err = two_sum(x2, g_y1)
+        g_y1 = self.G(_fn_input(y1))
+        y2 = _to_residual_dtype(x2) + _to_residual_dtype(g_y1)
         del x2
 
-        return y1, y2, y1_err, y2_err
+        return y1, y2
 
-    def backward_pass(self, y1, y2, dy1, dy2, y1_err, y2_err):
+    def backward_pass(self, y1, y2, dy1, dy2, amp_ctx):
         """
         equation for activation recomputation:
-        X_2 = Y_2 - G(Y_1), G = MLP   (exact via TwoSum error correction)
+        X_2 = Y_2 - G(Y_1), G = MLP
         X_1 = Y_1 - F(X_2), F = Attention
 
-        Uses TwoSum on the subtraction as well, then combines the forward
-        error (y2_err) with the subtraction error to achieve eps^2 precision.
+        Recomputation of G and F runs under the same autocast context that
+        was active during the forward pass, ensuring bitwise-identical results.
+        Residual subtractions use RESIDUAL_DTYPE (default float64) for
+        high-precision reconstruction.
         """
 
-        with torch.enable_grad():
-            y1.requires_grad = True
+        with torch.enable_grad(), amp_ctx:
+            y1_fn = _fn_input(y1)
+            y1_fn.requires_grad = True
 
-            g_y1 = self.G(y1)
+            g_y1 = self.G(y1_fn)
 
-            g_y1.backward(dy2, retain_graph=True)
+            g_y1.backward(dy2.to(g_y1.dtype), retain_graph=True)
 
         with torch.no_grad():
-            x2_approx, sub_err = two_sum(y2, -g_y1)
-            x2 = x2_approx + (sub_err + y2_err)
+            x2 = y2 - _to_residual_dtype(g_y1)
             del g_y1
 
-            dy1 = dy1 + y1.grad
+            dy1 = dy1 + y1_fn.grad.to(dy1.dtype)
 
-            y1.grad = None
+            y1_fn.grad = None
 
-        with torch.enable_grad():
-            x2.requires_grad = True
-            f_x2 = self.F(x2)
-            f_x2.backward(dy1, retain_graph=True)
+        with torch.enable_grad(), amp_ctx:
+            x2_fn = _fn_input(x2)
+            x2_fn.requires_grad = True
+            f_x2 = self.F(x2_fn)
+            f_x2.backward(dy1.to(f_x2.dtype), retain_graph=True)
 
         with torch.no_grad():
-            x1_approx, sub_err = two_sum(y1, -f_x2)
-            x1 = x1_approx + (sub_err + y1_err)
+            x1 = y1 - _to_residual_dtype(f_x2)
             del f_x2, y1
-            dy2 = dy2 + x2.grad
-            x2.grad = None
+            dy2 = dy2 + x2_fn.grad.to(dy2.dtype)
+            x2_fn.grad = None
             x2 = x2.detach()
 
         return x1, x2, dy1, dy2
@@ -205,20 +207,18 @@ class RevBackProp(Function):
     @staticmethod
     def forward(ctx, x, layers):
         x1, x2 = torch.chunk(x, 2, dim=-1)
+        x1, x2 = _to_residual_dtype(x1), _to_residual_dtype(x2)
 
         all_tensors = []
-        err_tensors = []
         if RevBackProp.debug:
             all_tensors.append([x1.detach(), x2.detach()])
 
         for layer in layers:
-            x1, x2, y1_err, y2_err = layer(x1, x2)
+            x1, x2 = layer(x1, x2)
             if RevBackProp.debug:
                 all_tensors.append([x1.detach(), x2.detach()])
-                err_tensors.append([y1_err.detach(), y2_err.detach()])
             else:
                 all_tensors = [x1.detach(), x2.detach()]
-                err_tensors.append([y1_err.detach(), y2_err.detach()])
 
         if RevBackProp.debug:
             with open("fwd_activations.pkl", "bw+") as f:
@@ -227,27 +227,36 @@ class RevBackProp(Function):
 
         ctx.save_for_backward(*all_tensors)
         ctx.layers = layers
-        ctx.err_tensors = err_tensors
+        ctx.input_dtype = x.dtype
+        device_type = x.device.type
+        amp_enabled = torch.is_autocast_enabled(device_type)
+        amp_dtype = torch.get_autocast_dtype(device_type) if amp_enabled else x.dtype
+        ctx.amp_ctx = torch.amp.autocast(
+            device_type=device_type,
+            dtype=amp_dtype,
+            enabled=amp_enabled,
+        )
 
-        return torch.cat([x1, x2], dim=-1)
+        out = torch.cat([x1, x2], dim=-1)
+        return out.to(x.dtype) if out.dtype != x.dtype else out
 
     @staticmethod
     def backward(ctx, dx):
         dx1, dx2 = torch.chunk(dx, 2, dim=-1)
+        dx1 = _to_residual_dtype(dx1)
+        dx2 = _to_residual_dtype(dx2)
 
         x1, x2 = ctx.saved_tensors
         layers = ctx.layers
-        err_tensors = ctx.err_tensors
+        amp_ctx = ctx.amp_ctx
 
         if RevBackProp.debug:
             all_tensors = [[x1.detach(), x2.detach()]]
 
-        for i, layer in enumerate(layers[::-1]):
-            err_idx = len(layers) - 1 - i
-            y1_err, y2_err = err_tensors[err_idx]
+        for _, layer in enumerate(layers[::-1]):
             x1, x2, dx1, dx2 = layer.backward_pass(
                 y1=x1, y2=x2, dy1=dx1, dy2=dx2,
-                y1_err=y1_err, y2_err=y2_err,
+                amp_ctx=amp_ctx,
             )
             if RevBackProp.debug:
                 all_tensors = [[x1.detach(), x2.detach()]] + all_tensors
@@ -258,6 +267,9 @@ class RevBackProp(Function):
             del all_tensors
 
         dx = torch.cat([dx1, dx2], dim=-1)
+        input_dtype = ctx.input_dtype
+        if dx.dtype != input_dtype:
+            dx = dx.to(input_dtype)
         del dx1, dx2, x1, x2
         return dx, None, None
 
@@ -330,11 +342,14 @@ class ReversibleGPT(nn.Module):
         """
         Rev layers w/o rev backprop, for debugging.
         """
+        orig_dtype = h.dtype
         x1, x2 = torch.chunk(h, 2, dim=-1)
+        x1, x2 = _to_residual_dtype(x1), _to_residual_dtype(x2)
         for _, block in enumerate(blocks):
-            x1, x2, _, _ = block(x1, x2)
+            x1, x2 = block(x1, x2)
 
-        return torch.cat([x1, x2], dim=-1)
+        out = torch.cat([x1, x2], dim=-1)
+        return out.to(orig_dtype) if out.dtype != orig_dtype else out
 
     def forward(self, idx, targets=None):
         device = idx.device
@@ -357,13 +372,9 @@ class ReversibleGPT(nn.Module):
             executing_fn = RevBackProp.apply
 
         x = executing_fn(x, self.transformer.h)
-
-        # for block in self.transformer.h:
-        #     x = block(x)
         x = self.transformer.ln_f(x)
 
-        # for now, average the two chunks so that the weight tying can happen 
-        # TODO: what's the smarter way of doing this? this gives some weird errors abt the view
+        # Average the two reversible streams to restore n_embd for the LM head
         x = torch.mean(x.reshape(*x.shape[:-1], -1, 2), dim=-1)
 
         if targets is not None:
@@ -516,30 +527,24 @@ class ReversibleGPT(nn.Module):
 
 
 if __name__ == "__main__":
-    # TODO: set the rng state for dropouts. 
     import os
     torch.random.manual_seed(0)
     device = torch.device("cuda")
-    try:
-        os.remove("fwd_activations.pkl")
-    except:
-        pass
-    try:
-        os.remove("bwd_activations.pkl")
-    except:
-        pass
+    for f in ("fwd_activations.pkl", "bwd_activations.pkl"):
+        try:
+            os.remove(f)
+        except FileNotFoundError:
+            pass
 
     RevBackProp.debug = True
     gptconf = GPTConfig(block_size=256, vocab_size=1024, n_layer=4, n_head=4, n_embd=256, dropout=0.0, bias=False)
     revGPT = ReversibleGPT(gptconf).to(device, dtype=torch.float64)
     revGPT.use_vanilla_backward = False
     print("vanilla bwd", revGPT.use_vanilla_backward)
-    # lr = 1e-2
     lr = 6e-4
     optimizer = revGPT.configure_optimizers(0.1, lr, (0.9, 0.95), device_type=device)
     optimizer.zero_grad()
 
-    # First, the loss outputs need to be the same obviously... 
     batch_size = 8
     seq_len = 128
     dummy_in = torch.randint(0, 256, (batch_size, seq_len)).to(device)
@@ -549,10 +554,7 @@ if __name__ == "__main__":
     print("loss:", loss.item())
     loss.backward()
     optimizer.step()
-    # breakpoint()
 
-    # Then make sure the activations between the forward of a dummy reversible and 
-    # real reversible are equal. 
     if RevBackProp.debug and os.path.exists("fwd_activations.pkl") and \
         os.path.exists("bwd_activations.pkl"):
         with open("fwd_activations.pkl", "rb") as f:
@@ -562,7 +564,7 @@ if __name__ == "__main__":
         assert len(fwd_acts) == len(bwd_acts), "Number of activations stored must be same"
         for i in range(len(fwd_acts)):
             fwd1, fwd2 = fwd_acts[i]
-            bwd1, bwd2 = bwd_acts[i] 
+            bwd1, bwd2 = bwd_acts[i]
             print(f"Activation {i} fwd/bwd 1: {torch.allclose(fwd1, bwd1)}")
             print(f"\tOverall norm: {torch.norm(fwd1)}")
             if not torch.allclose(fwd1, bwd1):
@@ -573,8 +575,3 @@ if __name__ == "__main__":
                 print(f"\tMax activation diff: {(fwd2 - bwd2).abs().max()}")
     else:
         print("not debug mode or pickled activations don't exist!")
-
-    # Hmmm so seems like layernorms are causing the activations to be different. 
-    # Ok WTF LMFAO why does setting layernorm eps = 1e-1 instead of 1e-5 solve 
-    #   all my activation problems? wtf...
-    #   ok seems to be b/c it just squashes all the norm (makes sense, overrides the acts)

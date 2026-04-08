@@ -7,6 +7,7 @@ import numpy as np
 import time
 import torch
 from model import GPTConfig, GPT
+from reversible_model import ReversibleGPT
 
 # -----------------------------------------------------------------------------
 batch_size = 12
@@ -16,6 +17,7 @@ real_data = True
 seed = 1337
 device = 'cuda' # examples: 'cpu', 'cuda', 'cuda:0', 'cuda:1', etc.
 dtype = 'bfloat16' if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else 'float16' # 'float32' or 'bfloat16' or 'float16'
+reversible = False
 compile = True # use PyTorch 2.0 to compile the model to be faster
 profile = False # use pytorch profiler, or just simple benchmarking?
 exec(open('configurator.py').read()) # overrides from command line or config file
@@ -28,6 +30,27 @@ torch.backends.cudnn.allow_tf32 = True # allow tf32 on cudnn
 device_type = 'cuda' if 'cuda' in device else 'cpu' # for later use in torch.autocast
 ptdtype = {'float32': torch.float32, 'bfloat16': torch.bfloat16, 'float16': torch.float16}[dtype]
 ctx = nullcontext() if device_type == 'cpu' else torch.amp.autocast(device_type=device_type, dtype=ptdtype)
+
+torch.cuda.reset_peak_memory_stats()
+
+before = torch.cuda.max_memory_reserved()
+
+# model init
+gptconf = GPTConfig(
+    block_size = block_size, # how far back does the model look? i.e. context size
+    n_layer = 12, n_head = 12, n_embd = 768, # size of the model
+    dropout = 0, # for determinism
+    bias = bias,
+)
+if reversible:
+    model = ReversibleGPT(gptconf)
+    model.use_vanilla_attention = False
+else:
+    model = GPT(gptconf)
+model.to(device)
+torch.cuda.synchronize()
+
+print("Model only memory:", torch.cuda.max_memory_reserved() / 1e9 if device_type == 'cuda' else 0, "GB")
 
 # data loading init
 if real_data:
@@ -47,21 +70,21 @@ else:
     y = torch.randint(50304, (batch_size, block_size), device=device)
     get_batch = lambda split: (x, y)
 
-# model init
-gptconf = GPTConfig(
-    block_size = block_size, # how far back does the model look? i.e. context size
-    n_layer = 12, n_head = 12, n_embd = 768, # size of the model
-    dropout = 0, # for determinism
-    bias = bias,
-)
-model = GPT(gptconf)
-model.to(device)
+torch.cuda.synchronize()
+
+print("Model + data memory:", torch.cuda.max_memory_reserved() / 1e9 if device_type == 'cuda' else 0, "GB")
 
 optimizer = model.configure_optimizers(weight_decay=1e-2, learning_rate=1e-4, betas=(0.9, 0.95), device_type=device_type)
+
+torch.cuda.synchronize()
+print("Model + data + optimizer:", torch.cuda.max_memory_reserved() / 1e9 if device_type == 'cuda' else 0, "GB")
 
 if compile:
     print("Compiling model...")
     model = torch.compile(model) # pytorch 2.0
+
+current = torch.cuda.memory_allocated()
+print(f"Current memory allocated (before training): {current / 1024**2:.2f} MB")
 
 if profile:
     # useful docs on pytorch profiler:
@@ -74,7 +97,7 @@ if profile:
         schedule=torch.profiler.schedule(wait=wait, warmup=warmup, active=active, repeat=1),
         on_trace_ready=torch.profiler.tensorboard_trace_handler('./bench_log'),
         record_shapes=False,
-        profile_memory=False,
+        profile_memory=True,
         with_stack=False, # incurs an additional overhead, disable if not needed
         with_flops=True,
         with_modules=False, # only for torchscript models atm
@@ -89,12 +112,13 @@ if profile:
             loss.backward()
             optimizer.step()
             lossf = loss.item()
-            print(f"{k}/{num_steps} loss: {lossf:.4f}")
+            print(f"{k}/{num_steps} loss: {lossf:.4f}, mem_res: {torch.cuda.max_memory_reserved() / 1e9 if device_type == 'cuda' else 0:.4f}" \
+                + f", mem_all: {torch.cuda.max_memory_allocated() / 1e9 if device_type == 'cuda' else 0:.4f}")
 
             prof.step() # notify the profiler at end of each step
 
 else:
-
+    torch.cuda.reset_peak_memory_stats()
     # simple benchmarking
     torch.cuda.synchronize()
     for stage, num_steps in enumerate([10, 20]): # burnin, then benchmark
@@ -108,7 +132,7 @@ else:
             loss.backward()
             optimizer.step()
             lossf = loss.item()
-            print(f"{k}/{num_steps} loss: {lossf:.4f}")
+            print(f"{k}/{num_steps} loss: {lossf:.4f}, mem: {torch.cuda.max_memory_reserved() / 1e9 if device_type == 'cuda' else 0} cur mem: {torch.cuda.memory_allocated() / 1e9 if device_type == 'cuda' else 0}")
         torch.cuda.synchronize()
         t1 = time.time()
         dt = t1-t0
